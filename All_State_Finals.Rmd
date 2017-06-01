@@ -1,0 +1,280 @@
+```{r}
+library(ggplot2) # Data visualization
+library(readr) # CSV file I/O, e.g. the read_csv function
+library(data.table)
+library(corrplot)
+require(caret)
+library(Matrix)
+library(xgboost)
+library(Metrics)
+require(FeatureHashing)
+library(h2o)
+```
+
+```{r}
+# Load libraries
+library(h2o); 
+
+#initalize the h2o environment
+h2o.init(  nthreads=-1,            ## -1: use all available threads
+          max_mem_size = "8G")    ## specify the memory size for the H2O cloud)
+h2o.removeAll() # Clean slate - just in case the cluster was already running
+
+```
+
+```{r}
+# Read input data
+train <- read.csv("~/Downloads/ISQS6348 Multivariate/Allstate/train.csv")
+test <- read.csv("~/Downloads/ISQS6348 Multivariate/Allstate/test.csv")
+
+#convert it into h2o readable format
+train <- as.h2o(train)
+test <- as.h2o(test)
+
+# know the diamension of the trainign and test data 
+dim(train)
+dim(test)
+
+# split the training dataset
+#maximum data in training set so that we do not overfit the model
+splits <- h2o.splitFrame(train, c(0.8,0.199), seed=12345)
+
+# select frames for H2o
+#dividing so that will be able to  use it for testing purpose 
+train  <- h2o.assign(splits[[1]], "train80.hex") 
+valid  <- h2o.assign(splits[[2]], "valid20.hex")
+```
+
+```{r}
+
+#convert to data.frame
+train <- as.data.frame(train)
+test <- as.data.frame(test)
+
+#first of all it is very importatnt to check whether the dataset has any missing values.
+sapply(train, function(x) sum(is.na(x)))
+sapply(test, function(x) sum(is.na(x)))
+
+#try to find of cat1
+correlations<- cor(train %>% select(contains("cont")),use="everything")
+corrplot(correlations, method="circle", type="lower",  sig.level = 0.01, insig = "blank")
+
+#select 10 rows and two numeric columns from the data.frame
+#here I am selecting some continuous feature and some categorical variable 
+train1 <- train[c(1:15),c(118:131)]
+test1 <- test[c(1:15),c(118:131)]
+
+x <- c(1:10)
+y <- c(10:1)
+
+#cor(x,y)
+df1 <- data.frame(x,y)
+df2 <- data.frame(x,y)
+x <- cor(df1,df2)
+#the ide of these method is obtained from https://rpubs.com/jelsner/849
+#this test proves that the features are highly correlated.
+cor.test(df1$x,df2$x,use = "everything",method="kendall")
+cor.test(df1$x,df2$x,use = "everything",method="pearson")
+cor.test(df1$x,df2$x,use = "everything",method="spearman")
+
+#Constant and almost constant predictors across samples (called zero and near-zero variance predictors in [1], respectively) happens quite often. One reason is because we usually break a categorical variable with many categories into several dummy variables. Hence, when one of the categories have zero observations, it becomes a dummy variable full of zeroes.
+
+zero.var <- nearZeroVar(train, saveMetrics=TRUE)
+zero.var
+head(zero.var[zero.var$nzv == TRUE,])
+
+#non of the feature is near zero variance i.e the value if zerovariance if false.
+#omiting any of th feature, we may loose important information.
+
+```
+
+```{r}
+#fread is some what faster than read.csv
+
+train.raw <- fread('~/Downloads/ISQS6348 Multivariate/Allstate/train.csv')
+test.raw <- fread('~/Downloads/ISQS6348 Multivariate/Allstate/test.csv')
+
+#adding id variable to test data set.
+test.id <- test.raw$id
+
+char.var <- names(train.raw)[sapply(train.raw, is.character)]
+cat(char.var)
+for(var in char.var) {
+  foo.levels <- unique(c(train.raw[[var]], test.raw[[var]]))
+  set(train.raw, j = var, value = factor(train.raw[[var]], levels = foo.levels))
+  set(test.raw, j = var, value = factor(test.raw[[var]], levels = foo.levels))
+}
+
+#creating response feature from train i.e the one which needs to be predicted.
+response <- train.raw$loss
+
+train.raw[, id := NULL]
+train.raw[, loss := NULL]
+test.raw[, id := NULL]
+
+merge <- rbind(train.raw, test.raw)
+merge$i <- 1:dim(merge)[1]
+factor.var <- names(train.raw)[sapply(train.raw, is.factor)]
+merge[, (factor.var) := lapply(.SD, as.numeric), .SDcols = factor.var]
+
+merge.sparse <- sparseMatrix(merge$i, merge[,char.var[1], with = FALSE][[1]])
+
+for(var in char.var[-1]){
+  merge.sparse <- cbind(merge.sparse, sparseMatrix(merge$i, merge[,var, with = FALSE][[1]])) 
+  cat('Combining: ', var, '\n')
+}
+
+merge.sparse <- cbind(merge.sparse, as.matrix(merge[,-c(char.var, 'i'), with = FALSE]))
+dim(merge.sparse)
+
+train <- merge.sparse[1:(dim(train.raw)[1]),]
+test <- merge.sparse[(dim(train.raw)[1] + 1):nrow(merge),]
+
+#from below link 
+# https://www.kaggle.com/nigelcarpenter/allstate-claims-severity/farons-xgb-starter-ported-to-r/code
+
+eval_MAE <- function (yhat, dtrain) {
+   y = getinfo(dtrain, "label")
+   err= mae(exp(y),exp(yhat) )
+   return (list(metric = "error", value = err))
+}
+
+xgb_params = list(
+  seed = 0,
+  colsample_bytree = 0.7,
+  subsample = 0.7,
+  eta = 0.075,
+  objective = 'reg:linear',
+  max_depth = 6,
+  num_parallel_tree = 1,
+  min_child_weight = 1,
+  base_score = 7
+)
+sample.index <- sample(1:nrow(train.raw), nrow(train.raw) * 0.8)
+
+dvalid <- xgb.DMatrix(train[-sample.index,], label = log(response[-sample.index]))
+train <- xgb.DMatrix(train[sample.index,], label = log(response[sample.index]))
+test <- xgb.DMatrix(test)
+
+#cross validation
+res = xgb.cv(xgb_params,
+             train,
+             nrounds=750,
+             nfold=4,
+             early_stopping_rounds=15,
+             print_every_n = 10,
+             verbose= 1,
+             feval=eval_MAE,    #custimized evaluation function. Returns list(metric='metric-name',                                                #value='metric-value') with given prediction and dtrain,
+             maximize=FALSE)
+
+best_nrounds = res$best_iteration
+
+xgb.modl <- xgb.train(xgb_params,
+             train,
+             nrounds=1000,
+             print_every_n = 10,
+             verbose= 1,
+             watchlist = list(valid_score = dvalid),
+             feval=eval_MAE,
+             early_stop_rounds = 20,
+             maximize=FALSE)
+
+xgb.prdct <- predict(xgb.modl, test)
+submission <- data.frame(id = test.id, loss = exp(xgb.prdct))
+write.csv(submission, 'Sayali_xgboostmodel.csv', row.names = FALSE)
+
+```
+
+
+
+```{r}
+set.seed(0)
+train <- read.csv("~/Downloads/ISQS6348 Multivariate/Allstate/train.csv")
+test <- read.csv("~/Downloads/ISQS6348 Multivariate/Allstate/test.csv")
+
+train<-train[,-1]
+test_label<-test[,1]
+test<-test[,-1]
+
+index<-sample(1:(dim(train)[1]), 0.2*dim(train)[1], replace=FALSE)
+
+train_frame<-train[-index,]
+valid_frame<-train[index,]
+
+valid_predict<-valid_frame[,-ncol(valid_frame)]
+valid_loss<-valid_frame[,ncol(valid_frame)]
+
+train_frame[,ncol(train_frame)]<-log(train_frame[,ncol(train_frame)])
+valid_frame[,ncol(train_frame)]<-log(valid_frame[,ncol(valid_frame)])
+
+kd_h2o<-h2o.init(nthreads = 16, max_mem_size = "16g")
+
+train_frame.hex<-as.h2o(train_frame)
+valid_frame.hex<-as.h2o(valid_frame)
+valid_predict.hex<-as.h2o(valid_predict)
+test.hex<-as.h2o(test)
+
+#My favorate model till now and the most easiest 
+rf<-h2o.randomForest(
+                x=1:(ncol(train_frame.hex)-1), 
+                y=ncol(train_frame.hex), 
+	              training_frame=train_frame.hex, 
+                validation_frame=valid_frame.hex, 
+		            ntrees=5)
+
+pred_rf<-(as.matrix(predict(rf, valid_predict.hex)))
+score_rf=mean(abs(exp(pred_rf)-valid_loss))
+
+#gbm
+model_gbm<-h2o.gbm(
+                  x=1:(ncol(train_frame.hex)-1), 
+                  y=ncol(train_frame.hex), 
+	                training_frame=train_frame.hex, validation_frame=valid_frame.hex, 
+		              ntrees=600, 
+		              distribution = c("AUTO"),
+		              stopping_metric= c("AUTO"),
+		              learn_rate = 0.05, 
+		              stopping_tolerance = 0.001,
+		              keep_cross_validation_predictions = FALSE,
+		              max_depth=4)
+
+pred_gbm<-as.matrix(predict(model_gbm, valid_predict.hex))
+score_gbm=mean(abs(exp(pred_gbm)-valid_loss))
+
+#deeplearning
+model_dp<-h2o.deeplearning(
+                      x=1:(ncol(train_frame.hex)-1),
+                      y=ncol(train_frame.hex), 
+	                    training_frame=train_frame.hex, validation_frame=valid_frame.hex,
+		                   model_id = "model2",       #this is optional, just to keep tarck of models iteration 
+                  	   standardize = TRUE,
+                  	   nfolds=0,				          # Cross validation
+                  	   activation="Tanh",	      	# activation function 
+                  	   hidden=c(700,500),	    		# select hidden topology (smaller is faster)
+                  	   epochs=120,			        	# add more to increase accuracy
+                  	   score_training_samples=10000, 	# faster training 
+                  	   stopping_rounds=20,			  # increase to run longer more accurate
+                  	   stopping_metric="AUTO", 	  # "MSE","logloss","r2","misclassification","auto"
+                  	                        #this must not be logloss or misclassification as we are do regression
+                  	   stopping_tolerance=0.0001,	# stop if not getting better
+                  	   max_runtime_secs=0,			  # dont run too long
+                  	   overwrite_with_best_model=TRUE,  # use best model along the way
+                  	   input_dropout_ratio=0)
+
+pred_dp<-as.matrix(predict(model_dp, valid_predict.hex))
+score_learning=mean(abs(exp(pred_dp)-valid_loss))
+
+pred_ensemble=(pred_gbm+pred_dp)/2
+score_ensemble=mean(abs(exp(pred_ensemble)-valid_loss))
+
+pred_gbm_all<-(as.matrix(predict(model_gbm, test.hex)))
+
+pred_all<-(as.matrix(predict(model_dp, test.hex)))
+pred<-exp((pred_gbm_all+pred_all)/2)
+
+sample_submission <-  submission = read.csv("~/Downloads/ISQS6348 Multivariate/Allstate/sample_submission.csv")
+submission$loss = pred
+write.csv(submission, 'Sayali_Submission.csv', row.names=FALSE)
+h2o.shutdown(prompt=FALSE)
+
+```
